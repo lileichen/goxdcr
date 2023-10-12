@@ -1180,10 +1180,10 @@ func Uint64ToBase64(u64 uint64) []byte {
 // This routine expect prefix 0x since this is included in KV macro expansion.
 func HexLittleEndianToUint64(hexLE []byte) (uint64, error) {
 	if len(hexLE) <= 2 {
-		return 0, fmt.Errorf("Hex input too short.")
+		return 0, fmt.Errorf("Hex input value %s is too short. Leading 0x is expected.", hexLE)
 	}
 	if hexLE[0] != '0' || hexLE[1] != 'x' {
-		return 0, fmt.Errorf("Incorrect hex input %v", hexLE)
+		return 0, fmt.Errorf("Incorrect hex little endian input %s", hexLE)
 	}
 	decoded := make([]byte, hex.DecodedLen(len(hexLE[2:])))
 	_, err := hex.Decode(decoded, hexLE[2:])
@@ -1839,7 +1839,7 @@ func (lookupResp *SubdocLookupResponse) ResponseForAPath(path string) ([]byte, e
 			pos = pos + 4 + len
 		}
 	}
-	return nil, errors.New("SUBDOC_MULTI_LOOKUP does not include this path")
+	return nil, fmt.Errorf("SUBDOC_MULTI_LOOKUP does not include the path %v", path)
 }
 
 func (lookupResp *SubdocLookupResponse) FindTargetBodyWithoutXattr() ([]byte, error) {
@@ -1861,110 +1861,6 @@ func (lookupResp *SubdocLookupResponse) IsTargetJson() (bool, error) {
 	} else {
 		return false, nil
 	}
-}
-
-func (lookupResp *SubdocLookupResponse) FindTargetCustomCRXattr(targetId []byte) (crMeta *CustomCRMeta, err error) {
-	xattr, err := lookupResp.ResponseForAPath(XATTR_XDCR)
-	if err != nil {
-		return nil, err
-	}
-	if xattr == nil {
-		return NewCustomCRMeta(targetId, lookupResp.Resp.Cas, nil, nil, nil, nil)
-	}
-
-	id, cv, pcas, mv, err := findCustomCRXattrFields(xattr)
-	if err != nil {
-		return nil, err
-	}
-	return NewCustomCRMeta(targetId, lookupResp.Resp.Cas, id, cv, pcas, mv)
-}
-
-/*
- * vv is a version vector in the form {"key":"value","key":"value",...}. It is either PCAS or MV.
- * Key is clusterID. Value is Cas encoded with base64.
- * returns the Cas value converted back to uint64 if found for the key
- * returns 0 if not found
- */
-func findItemInVV(vv []byte, key []byte) (cas uint64, err error) {
-	if len(vv) == 0 {
-		return 0, nil
-	}
-	it, err := NewCCRXattrFieldIterator(vv)
-	if err != nil {
-		return 0, err
-	}
-	for it.HasNext() {
-		itemKey, itemValue, err := it.Next()
-		if err != nil {
-			return 0, err
-		}
-		if bytes.Equal(itemKey, key) {
-			return Base64ToUint64(itemValue)
-		}
-	}
-	return 0, nil
-}
-
-// This will find the custom CR XATTR from the req body
-func FindSourceCustomCRXattr(req *mc.MCRequest, sourceId []byte) (crMeta *CustomCRMeta, err error) {
-	cas := binary.BigEndian.Uint64(req.Extras[16:24])
-	if req.DataType&mcc.XattrDataType == 0 {
-		return NewCustomCRMeta(sourceId, cas, nil, nil, nil, nil)
-	}
-	body := req.Body
-	var pos uint32 = 0
-	pos = pos + 4
-	xattrIter, err := NewXattrIterator(body)
-	if err != nil {
-		return
-	}
-	var key, value []byte
-	var xattr []byte
-	for xattrIter.HasNext() {
-		key, value, err = xattrIter.Next()
-		if err != nil {
-			return
-		}
-		if Equals(key, XATTR_XDCR) {
-			xattr = value
-			break
-		}
-	}
-	if xattr == nil {
-		// Source does not have _xdcr XATTR
-		return NewCustomCRMeta(sourceId, cas, nil, nil, nil, nil)
-	}
-	// Found _xdcr XATTR. Now find the fields
-	id, cv, pcas, mv, err := findCustomCRXattrFields(xattr)
-	if err != nil {
-		// TODO: MB-40143: Remove before CC shipping
-		panic(err.Error())
-	}
-	return NewCustomCRMeta(sourceId, cas, id, cv, pcas, mv)
-}
-
-func findCustomCRXattrFields(xattr []byte) (clusterId, cv, pcas, mv []byte, err error) {
-	it, err := NewCCRXattrFieldIterator(xattr)
-	if err != nil {
-		return
-	}
-	for it.HasNext() {
-		var key, value []byte
-		key, value, err = it.Next()
-		if err != nil {
-			return
-		}
-		if Equals(key, XATTR_ID) {
-			clusterId = value
-		} else if Equals(key, XATTR_CV) {
-			cv = value
-		} else if Equals(key, XATTR_PCAS) {
-			pcas = value
-		} else if Equals(key, XATTR_MV) {
-			mv = value
-		}
-	}
-	return
 }
 
 func ValidateRemoteClusterName(name string, errorsMap map[string]error) {
@@ -2059,4 +1955,113 @@ func DecomposeVBHighSeqnoStatsKey(key string) (uint16, error) {
 		return 0, err
 	}
 	return uint16(vbnoInt), nil
+}
+
+func DecodeSetMetaReq(req *mc.MCRequest) DocumentMetadata {
+	ret := DocumentMetadata{}
+	ret.Key = req.Key
+	ret.Flags = binary.BigEndian.Uint32(req.Extras[0:4])
+	ret.Expiry = binary.BigEndian.Uint32(req.Extras[4:8])
+	ret.RevSeq = binary.BigEndian.Uint64(req.Extras[8:16])
+	ret.Cas = req.Cas
+	ret.Deletion = (req.Opcode == DELETE_WITH_META)
+	ret.DataType = req.DataType
+
+	return ret
+}
+
+func DecodeGetMetaResp(key []byte, resp *mc.MCResponse, xattrEnabled bool) (DocumentMetadata, error) {
+	ret := DocumentMetadata{}
+	ret.Key = key
+	extras := resp.Extras
+	ret.Deletion = (binary.BigEndian.Uint32(extras[0:4]) != 0)
+	ret.Flags = binary.BigEndian.Uint32(extras[4:8])
+	ret.Expiry = binary.BigEndian.Uint32(extras[8:12])
+	ret.RevSeq = binary.BigEndian.Uint64(extras[12:20])
+	ret.Cas = resp.Cas
+	if xattrEnabled {
+		if len(extras) < 20 {
+			return ret, fmt.Errorf("Received unexpected getMeta response, which does not include data type in extras. extras=%v", extras)
+		}
+		ret.DataType = extras[20]
+	} else {
+		ret.DataType = resp.DataType
+	}
+	return ret, nil
+}
+
+func DecodeSubDocResp(key []byte, lookupResp *SubdocLookupResponse) (DocumentMetadata, error) {
+	specs := lookupResp.Specs
+	resp := lookupResp.Resp
+	body := resp.Body
+	if IsSuccessSubdocLookupResponse(resp) == false {
+		return DocumentMetadata{}, fmt.Errorf("Cannot decode subdoc lookup response because the lookup failed with status %v", resp.Status)
+	}
+	pos := 0
+	docMeta := DocumentMetadata{
+		Key:      key,
+		RevSeq:   0,
+		Cas:      resp.Cas,
+		Flags:    0,
+		Expiry:   0,
+		Deletion: IsDeletedSubdocLookupResponse(resp),
+		DataType: 0,
+	}
+	for i := 0; i < len(specs); i++ {
+		spec := specs[i]
+		status := mc.Status(binary.BigEndian.Uint16(body[pos : pos+2]))
+		pos = pos + 2
+		xattrlen := int(binary.BigEndian.Uint32(body[pos : pos+4]))
+		if pos+xattrlen > len(body) {
+			// This should never happen
+			return DocumentMetadata{}, fmt.Errorf("Returned value length %v for subdoc_get path %v exceeds body length", xattrlen, spec.Path)
+		}
+		pos = pos + 4
+		value := string(body[pos : pos+xattrlen])
+		if status == mc.SUCCESS {
+			switch string(spec.Path) {
+			case VXATTR_REVID:
+				if xattrlen < 3 {
+					// This should never happen
+					return DocumentMetadata{}, fmt.Errorf("Unexpected return value length %v for subdoc_get path %v", xattrlen, VXATTR_REVID)
+				}
+				// KV returns $document.revid as a string. So skip the quotes in the return value
+				if revid, err := strconv.ParseUint(value[1:xattrlen-1], 10, 64); err == nil {
+					docMeta.RevSeq = uint64(revid)
+				}
+			case VXATTR_DATATYPE:
+				if isJson, err := regexp.Match(JsonDataTypeStr, body[pos:pos+xattrlen]); err == nil && isJson {
+					docMeta.DataType = docMeta.DataType | JSONDataType
+				}
+				if isSnappy, err := regexp.Match(SnappyDataTypeStr, body[pos:pos+xattrlen]); err == nil && isSnappy {
+					docMeta.DataType = docMeta.DataType | SnappyDataType
+				}
+				if isXattr, err := regexp.Match(XattrDataTypeStr, body[pos:pos+xattrlen]); err == nil && isXattr {
+					docMeta.DataType = docMeta.DataType | XattrDataType
+				}
+			case VXATTR_EXPIRY:
+				if expiry, err := strconv.ParseUint(value, 10, 32); err == nil {
+					docMeta.Expiry = uint32(expiry)
+				}
+			case VXATTR_FLAGS:
+				if flag, err := strconv.ParseUint(value, 10, 32); err == nil {
+					docMeta.Flags = uint32(flag)
+				}
+			}
+		}
+		pos = pos + xattrlen
+	}
+	return docMeta, nil
+}
+
+type PruningFunc func(cas uint64) bool
+
+func GetHLVPruneFunction(now uint64, pruningWindow time.Duration) PruningFunc {
+	return func(cas uint64) bool {
+		if pruningWindow == 0 {
+			// No pruning if 0
+			return false
+		}
+		return CasDuration(cas, now) >= pruningWindow
+	}
 }
