@@ -84,7 +84,7 @@ var MaxErrorMessageLength = 400
 var BatchHistorySize = 20
 
 /************************************
-/* struct capiBatch
+ * struct capiBatch
  * NOTE: see dataBatch comments for more info
 *************************************/
 type capiBatch struct {
@@ -93,7 +93,7 @@ type capiBatch struct {
 }
 
 /************************************
-/* struct capiConfig
+ * struct capiConfig
 *************************************/
 type capiConfig struct {
 	baseConfig
@@ -147,7 +147,7 @@ func (config *capiConfig) initializeConfig(settings metadata.ReplicationSettings
 }
 
 /************************************
-/* struct CapiNozzle
+ * struct CapiNozzle
 *************************************/
 type CapiNozzle struct {
 	AbstractPart
@@ -761,7 +761,7 @@ func (capi *CapiNozzle) batchSendWithRetry(batch *capiBatch) error {
 					capi.Logger().Debugf("%v did not send doc with key %v since it failed conflict resolution\n", capi.Id(), base.TagUD(item.Req.Key))
 				}
 				additionalInfo := DataFailedCRSourceEventAdditional{Seqno: item.Seqno,
-					Opcode:      encodeOpCode(item.Req, false /* isCustomCR */),
+					Opcode:      encodeOpCode(item.Req, SetMetaXattrOptions{}),
 					IsExpirySet: (binary.BigEndian.Uint32(item.Req.Extras[4:8]) != 0),
 					VBucket:     item.Req.VBucket,
 				}
@@ -846,11 +846,11 @@ func (capi *CapiNozzle) validateRunningState() error {
 
 func (capi *CapiNozzle) adjustRequest(req *base.WrappedMCRequest) {
 	mc_req := req.Req
-	mc_req.Opcode = encodeOpCode(mc_req, false /* isCustomCR */)
+	mc_req.Opcode = encodeOpCode(mc_req, SetMetaXattrOptions{})
 	mc_req.Cas = 0
 }
 
-//batch call to update docs on target
+// batch call to update docs on target
 func (capi *CapiNozzle) batchUpdateDocsWithRetry(vbno uint16, req_list *[]*base.WrappedMCRequest) error {
 	if len(*req_list) == 0 {
 		return nil
