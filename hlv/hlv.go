@@ -82,15 +82,19 @@ type currentVersion struct {
 // If cas > ver, then the document has been mutated since replication.
 // - If there is no mv, the input cv will be rolled into pv
 // - If there is an mv, the mv will be rolled into pv
-func NewHLV(source DocumentSourceId, cas uint64, src DocumentSourceId, ver uint64, pv, mv VersionsMap) (*HLV, error) {
+func NewHLV(source DocumentSourceId, cas uint64, cvCas uint64, src DocumentSourceId, ver uint64, pv, mv VersionsMap) (*HLV, error) {
 	hlv := HLV{
 		cvCAS: cas,
 	}
-	if cas < ver {
-		// ver is initially the same as cas. Cas may increase later. So ver should never be greater than cas
-		return nil, fmt.Errorf("cas < ver, cas=%v,ver=%v,src=%v,pv=%s,mv=%s", cas, ver, src, pv, mv)
-	} else if cas == ver {
+	if cas < cvCas {
+		// When XDCR or mobile sends a mutation, it sets cvCas to the same value as CAS.
+		// If cas == cvCas, it means there has been no local change since replication
+		// If cas > cvCas, it means there has been local changes after replication.
+		// cas should never be smaller
+		return nil, fmt.Errorf("cas < cvCas, cas=%v,cvCas=%v,ver=%v,src=%v,pv=%s,mv=%s", cas, cvCas, ver, src, pv, mv)
+	} else if cas == cvCas {
 		// The HLV did not change.
+		hlv.cvCAS = cvCas
 		hlv.cv = currentVersion{src, ver}
 		hlv.pv = pv
 		hlv.mv = mv
@@ -98,6 +102,7 @@ func NewHLV(source DocumentSourceId, cas uint64, src DocumentSourceId, ver uint6
 	} else {
 		// CAS has Updated. This new CAS is the current version. Everything else is rolled into pv
 		hlv.Updated = true
+		hlv.cvCAS = cas
 		hlv.cv = currentVersion{source, cas}
 		hlv.pv = pv
 		if len(mv) > 0 {
@@ -131,6 +136,12 @@ func (h *HLV) GetPV() VersionsMap {
 	return h.pv
 }
 
+func (h *HLV) GetCvCas() uint64 {
+	if h == nil {
+		return 0
+	}
+	return h.cvCAS
+}
 func (h *HLV) GetCvSrc() DocumentSourceId {
 	if h == nil {
 		return ""
