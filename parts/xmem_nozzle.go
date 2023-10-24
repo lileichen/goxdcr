@@ -414,7 +414,7 @@ func (buf *requestBuffer) enSlot(mcreq *base.WrappedMCRequest, opt SetMetaXattrO
 func (buf *requestBuffer) adjustRequest(req *base.WrappedMCRequest, index uint16, opt SetMetaXattrOptions) {
 	mc_req := req.Req
 	mc_req.Opcode = encodeOpCode(mc_req, opt)
-	if opt.noTargetCR == false {
+	if !opt.noTargetCR {
 		// No need for Cas locking in normal case when target CR is expected
 		mc_req.Cas = 0
 	}
@@ -644,8 +644,8 @@ type XmemNozzle struct {
 	sourceBucketUuid  string // used in HLV
 	targetBucketUuid  string
 
-	// Source and target cluster ID. Used for custom CR in XATTR _xdcr to identify source of changes.
-	// For DP, they are the cluster UUID encoded in base64. For test we can set it to any unique string.
+	// Source and target bucket ID. Used for HLV in XATTR to identify source of changes.
+	// They are set bucketUuid encoded in base64 to save space.
 	sourceBucketId hlv.DocumentSourceId
 	targetBucketId hlv.DocumentSourceId
 
@@ -883,6 +883,10 @@ func (xmem *XmemNozzle) Start(settings metadata.ReplicationSettingsMap) error {
 	xmem.childrenWaitGrp.Add(1)
 	go xmem.processData_sendbatch(xmem.finish_ch, &xmem.childrenWaitGrp)
 
+	if xmem.source_cr_mode == base.CRMode_Custom || xmem.config.crossClusterVers {
+		xmem.dataPool = base.NewDataPool()
+	}
+
 	xmem.start_time = time.Now()
 
 	err = xmem.SetState(common.Part_Running)
@@ -890,16 +894,7 @@ func (xmem *XmemNozzle) Start(settings metadata.ReplicationSettingsMap) error {
 		return err
 	}
 
-	if xmem.source_cr_mode == base.CRMode_Custom || xmem.config.crossClusterVers {
-		xmem.dataPool = base.NewDataPool()
-	}
-
-	if xmem.config.crossClusterVers {
-		xmem.Logger().Infof("%v has been started with %v=%v, %v=%v", xmem.Id(),
-			base.EnableCrossClusterVersioningKey, xmem.config.crossClusterVers, base.VersionPruningWindowHrsKey, xmem.config.hlvPruningWindowSec)
-	} else {
-		xmem.Logger().Infof("%v has been started", xmem.Id())
-	}
+	xmem.Logger().Infof("%v has been started", xmem.Id())
 
 	return nil
 }
@@ -1640,7 +1635,7 @@ func (xmem *XmemNozzle) batchGetMeta(bigDoc_map base.McRequestMap) (map[string]N
 		if ok && resp.Status == mc.SUCCESS {
 			res, err := xmem.conflict_resolver(wrappedReq, resp, nil, xmem.sourceBucketId, xmem.targetBucketId, xmem.xattrEnabled, xmem.Logger())
 			if err != nil {
-				xmem.Logger().Warnf("%v batchGetMeta: Error decoding getMeta response for doc %v%s%v. err=%v. Skip conflict resolution and send the doc", xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
+				xmem.Logger().Warnf("%v batchGetMeta: Error from conflict_resolver for doc %v%s%v. err=%v. Skip conflict resolution and send the doc", xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
 				continue
 			}
 			switch res {
@@ -1649,13 +1644,20 @@ func (xmem *XmemNozzle) batchGetMeta(bigDoc_map base.McRequestMap) (map[string]N
 					sourceDoc := crMeta.NewSourceDocument(wrappedReq, xmem.sourceBucketId)
 					sourceMeta, err := sourceDoc.GetMetadata()
 					if err != nil {
-						xmem.Logger().Warnf("%v batchGetMeta: Error decoding source document metadata for doc %v%q%v. err=%v. Skip conflict resolution and send the doc", xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
+						xmem.Logger().Warnf("%v batchGetMeta: doc %v%q%v failed source side conflict resolution, but had error decoding source document metadata for logging. err=%v.",
+							xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
 						continue
 					}
-					targetDoc := crMeta.NewTargetDocument([]byte(key), resp, nil, xmem.targetBucketId, xmem.xattrEnabled, false)
+					targetDoc, err := crMeta.NewTargetDocument([]byte(key), resp, nil, xmem.targetBucketId, xmem.xattrEnabled, false)
+					if err != nil {
+						xmem.Logger().Warnf("%v batchGetMeta: doc %v%q%v failed source side conflict resolution, but had error decoding target document metadata for logging. err=%v.",
+							xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
+						continue
+					}
 					targetMeta, err := targetDoc.GetMetadata()
 					if err != nil {
-						xmem.Logger().Warnf("%v batchGetMeta: Error decoding target document metadata for doc %v%q%v. err=%v. Skip conflict resolution and send the doc", xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
+						xmem.Logger().Warnf("%v batchGetMeta: doc %v%q%v failed source side conflict resolution, but had error decoding target document metadata for logging. err=%v.",
+							xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
 						continue
 					}
 					docMetaSrcRedacted := sourceMeta.GetDocumentMetadata().CloneAndRedact()
@@ -1671,10 +1673,16 @@ func (xmem *XmemNozzle) batchGetMeta(bigDoc_map base.McRequestMap) (map[string]N
 						xmem.Logger().Warnf("%v batchGetMeta: Error decoding source document metadata for doc %v%q%v. err=%v. Skip conflict resolution and send the doc", xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
 						continue
 					}
-					targetDoc := crMeta.NewTargetDocument([]byte(key), resp, nil, xmem.targetBucketId, xmem.xattrEnabled, false)
+					targetDoc, err := crMeta.NewTargetDocument([]byte(key), resp, nil, xmem.targetBucketId, xmem.xattrEnabled, false)
+					if err == base.ErrorDocumentNotFound {
+						xmem.Logger().Warnf("%v batchGetMeta: doc %v%q%v won source side conflict resolution because target document does not exist.",
+							xmem.Id(), base.UdTagBegin, key, base.UdTagEnd)
+						continue
+					}
 					targetMeta, err := targetDoc.GetMetadata()
 					if err != nil {
-						xmem.Logger().Warnf("%v batchGetMeta: Error decoding target document metadata for doc %v%q%v. err=%v. Skip conflict resolution and send the doc", xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
+						xmem.Logger().Warnf("%v batchGetMeta: doc %v%q%v won source side conflict resolution, but had error decoding target document metadata for logging. err=%v.",
+							xmem.Id(), base.UdTagBegin, key, base.UdTagEnd, err)
 						continue
 					}
 					docMetaSrcRedacted := sourceMeta.GetDocumentMetadata().CloneAndRedact()
@@ -2035,7 +2043,6 @@ func (xmem *XmemNozzle) updateHlvInXattrForTarget(wrappedReq *base.WrappedMCRequ
 
 	docWithoutXattr := base.FindSourceBodyWithoutXattr(req)
 	out, atLeastOneXattr := xattrComposer.FinishAndAppendDocValue(docWithoutXattr)
-	req.Bytes()
 	req.Body = out
 	if atLeastOneXattr {
 		req.DataType = req.DataType | mcc.XattrDataType
@@ -2871,8 +2878,8 @@ func (xmem *XmemNozzle) resendIfTimeout(req *bufferedMCRequest, pos uint16) (boo
 		}
 		if req.num_of_retry > maxRetry {
 			req.timedout = true
-			err = errors.New(fmt.Sprintf("%v Failed to resend document %v%s%v, has tried to resend it %v, maximum retry %v reached",
-				xmem.Id(), base.UdTagBegin, bytes.Trim(req.req.Req.Key, "\x00"), base.UdTagEnd, req.num_of_retry, maxRetry))
+			err = errors.New(fmt.Sprintf("%v Failed to resend document %v%q%v, has tried to resend it %v, maximum retry %v reached",
+				xmem.Id(), base.UdTagBegin, req.req.Req.Key, base.UdTagEnd, req.num_of_retry, maxRetry))
 			xmem.Logger().Error(err.Error())
 
 			lastErrIsDueToCollectionMapping := req.collectionMapErr
@@ -3048,7 +3055,6 @@ func encodeOpCode(req *mc.MCRequest, setOption SetMetaXattrOptions) mc.CommandCo
 			}
 		} else {
 			return base.SET_WITH_META
-
 		}
 	} else if code == mc.TAP_DELETE || code == mc.UPR_DELETION || code == mc.UPR_EXPIRATION {
 		return base.DELETE_WITH_META
