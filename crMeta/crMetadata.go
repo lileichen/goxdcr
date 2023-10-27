@@ -40,9 +40,13 @@ const (
 
 type CRMetadata struct {
 	docMeta *base.DocumentMetadata
-	hlv     *hlv.HLV
-	hadPv   bool
-	hadMv   bool
+	// The HLV is always updated from what's stored in the document XATTR,
+	// ie, MV may roll into PV if necessary, and PV may get pruned, and CV may be updated.
+	hlv *hlv.HLV
+	// The following indicate if the document has PV/MV in the XATTR. Since the HLV may be different from what's stored in
+	// XATTR, we need the following to decide whether to send delete for PV or MV in the subdoc command.
+	hadPv bool
+	hadMv bool
 }
 
 func (m *CRMetadata) GetDocumentMetadata() *base.DocumentMetadata {
@@ -94,7 +98,7 @@ func NewSourceDocument(req *base.WrappedMCRequest, source hlv.DocumentSourceId) 
 
 func (doc *SourceDocument) GetMetadata() (*CRMetadata, error) {
 	docMeta := base.DecodeSetMetaReq(doc.req.Req)
-	cas, cvCas, cvSrc, cvVer, pvMap, mvMap, err := getMetaFromMCRequest(doc.req.Req)
+	cas, cvCas, cvSrc, cvVer, pvMap, mvMap, err := getHlvFromMCRequest(doc.req.Req)
 	if err != nil {
 		return nil, err
 	}
@@ -102,9 +106,11 @@ func (doc *SourceDocument) GetMetadata() (*CRMetadata, error) {
 		docMeta: &docMeta,
 	}
 	if len(pvMap) > 0 {
+		// This comes straight from source document XATTR. So source had it.  meta.hlv tells us if it still has it
 		meta.hadPv = true
 	}
 	if len(mvMap) > 0 {
+		// This comes straight from source document XATTR. So source had it.  meta.hlv tells us if it still has it
 		meta.hadMv = true
 	}
 	meta.hlv, err = hlv.NewHLV(doc.source, cas, cvCas, cvSrc, cvVer, pvMap, mvMap)
@@ -119,9 +125,13 @@ type TargetDocument struct {
 	resp         *base.SubdocLookupResponse
 	key          []byte
 	xattrEnabled bool // This affects how to interpret getMeta response.
+	includeHlv   bool
 }
 
-func NewTargetDocument(key []byte, resp *mc.MCResponse, specs []base.SubdocLookupPathSpec, source hlv.DocumentSourceId, xattrEnabled bool) *TargetDocument {
+func NewTargetDocument(key []byte, resp *mc.MCResponse, specs []base.SubdocLookupPathSpec, source hlv.DocumentSourceId, xattrEnabled, includeHlv bool) (*TargetDocument, error) {
+	if resp.Status == mc.KEY_ENOENT {
+		return nil, base.ErrorDocumentNotFound
+	}
 	return &TargetDocument{
 		source: source,
 		resp: &base.SubdocLookupResponse{
@@ -130,16 +140,13 @@ func NewTargetDocument(key []byte, resp *mc.MCResponse, specs []base.SubdocLooku
 		},
 		key:          key,
 		xattrEnabled: xattrEnabled,
-	}
+		includeHlv:   includeHlv,
+	}, nil
 }
 
 func (doc *TargetDocument) GetMetadata() (*CRMetadata, error) {
 	if doc.resp.Resp.Status == mc.KEY_ENOENT {
-		meta := CRMetadata{
-			docMeta: nil,
-			hlv:     nil,
-		}
-		return &meta, nil
+		return nil, base.ErrorDocumentNotFound
 	}
 	if doc.resp.Resp.Opcode == base.GET_WITH_META {
 		// This is a getMeta response from target
@@ -157,22 +164,26 @@ func (doc *TargetDocument) GetMetadata() (*CRMetadata, error) {
 		if err != nil {
 			return nil, err
 		}
-		cas, cvCas, cvSrc, cvVer, pvMap, mvMap, err := getMetaFromMCResponse(doc.resp)
-		if err != nil {
-			return nil, err
-		}
 		meta := CRMetadata{
 			docMeta: &docMeta,
 		}
-		if len(pvMap) > 0 {
-			meta.hadPv = true
-		}
-		if len(mvMap) > 0 {
-			meta.hadMv = true
-		}
-		meta.hlv, err = hlv.NewHLV(doc.source, cas, cvCas, cvSrc, cvVer, pvMap, mvMap)
-		if err != nil {
-			return nil, err
+		if doc.includeHlv {
+			cas, cvCas, cvSrc, cvVer, pvMap, mvMap, err := getHlvFromMCResponse(doc.resp)
+			if err != nil {
+				return nil, err
+			}
+			if len(pvMap) > 0 {
+				// This comes straight from source document XATTR. So target had it.  meta.hlv tells us if it still has it
+				meta.hadPv = true
+			}
+			if len(mvMap) > 0 {
+				// This comes straight from source document XATTR. So target had it.  meta.hlv tells us if it still has it
+				meta.hadMv = true
+			}
+			meta.hlv, err = hlv.NewHLV(doc.source, cas, cvCas, cvSrc, cvVer, pvMap, mvMap)
+			if err != nil {
+				return nil, err
+			}
 		}
 		return &meta, nil
 	}
@@ -190,7 +201,12 @@ func DetectConflictWithHLV(req *base.WrappedMCRequest, resp *mc.MCResponse, spec
 	if err != nil {
 		return base.Error, err
 	}
-	targetDoc := NewTargetDocument(req.Req.Key, resp, specs, targetId, xattrEnabled)
+	targetDoc, err := NewTargetDocument(req.Req.Key, resp, specs, targetId, xattrEnabled, true)
+	if err == base.ErrorDocumentNotFound {
+		return base.SendToTarget, nil
+	} else if err != nil {
+		return base.Error, err
+	}
 	targetMeta, err := targetDoc.GetMetadata()
 	if err != nil {
 		return base.Error, err
@@ -250,7 +266,12 @@ func ResolveConflictByCAS(req *base.WrappedMCRequest, resp *mc.MCResponse, specs
 			return base.Error, err
 		}
 	} else if resp.Opcode == mc.SUBDOC_MULTI_LOOKUP {
-		target_doc := NewTargetDocument(req.Req.Key, resp, specs, targetId, xattrEnabled)
+		target_doc, err := NewTargetDocument(req.Req.Key, resp, specs, targetId, xattrEnabled, false)
+		if err == base.ErrorDocumentNotFound {
+			return base.SendToTarget, nil
+		} else if err != nil {
+			return base.Error, err
+		}
 		target_meta, err := target_doc.GetMetadata()
 		if err != nil {
 			return base.Error, err
@@ -297,7 +318,12 @@ func ResolveConflictByRevSeq(req *base.WrappedMCRequest, resp *mc.MCResponse, sp
 			return base.Error, err
 		}
 	} else if resp.Opcode == mc.SUBDOC_MULTI_LOOKUP {
-		target_doc := NewTargetDocument(req.Req.Key, resp, specs, targetId, xattrEnabled)
+		target_doc, err := NewTargetDocument(req.Req.Key, resp, specs, targetId, xattrEnabled, false)
+		if err == base.ErrorDocumentNotFound {
+			return base.SendToTarget, nil
+		} else if err != nil {
+			return base.Error, err
+		}
 		target_meta, err := target_doc.GetMetadata()
 		if err != nil {
 			return base.Error, err
@@ -359,7 +385,7 @@ func NeedToUpdateXattr(meta *CRMetadata, pruningWindow time.Duration) (bool, err
 
 // This routine construct XATTR _vv:{...} based on meta. The constructed XATTRs includes updates for
 // new change (meta.cas > meta.ver) and pruning in PV
-func ConstructCustomCRXattrForSetMeta(meta *CRMetadata, pruningWindow time.Duration, xattrComposer *base.XattrComposer) (int, error) {
+func ConstructXattrFromHlvForSetMeta(meta *CRMetadata, pruningWindow time.Duration, xattrComposer *base.XattrComposer) (int, error) {
 	if meta == nil {
 		return 0, fmt.Errorf("Metadata cannot be nil")
 	}
@@ -620,7 +646,7 @@ func parseHlvFields(cas uint64, xattr []byte) (cvCas uint64, src hlv.DocumentSou
 	return
 }
 
-func getMetaFromMCResponse(lookupResp *base.SubdocLookupResponse) (cas, cvCas uint64, cvSrc hlv.DocumentSourceId, cvVer uint64,
+func getHlvFromMCResponse(lookupResp *base.SubdocLookupResponse) (cas, cvCas uint64, cvSrc hlv.DocumentSourceId, cvVer uint64,
 	pvMap, mvMap hlv.VersionsMap, err error) {
 	cas = lookupResp.Resp.Cas
 	xattr, err1 := lookupResp.ResponseForAPath(base.XATTR_HLV)
@@ -641,7 +667,7 @@ func getMetaFromMCResponse(lookupResp *base.SubdocLookupResponse) (cas, cvCas ui
 }
 
 // This will find the custom CR XATTR from the req body
-func getMetaFromMCRequest(req *mc.MCRequest) (cas, cvCas uint64, cvSrc hlv.DocumentSourceId, cvVer uint64, pvMap, mvMap hlv.VersionsMap, err error) {
+func getHlvFromMCRequest(req *mc.MCRequest) (cas, cvCas uint64, cvSrc hlv.DocumentSourceId, cvVer uint64, pvMap, mvMap hlv.VersionsMap, err error) {
 	cas = binary.BigEndian.Uint64(req.Extras[16:24])
 	if req.DataType&mcc.XattrDataType == 0 {
 		return

@@ -355,6 +355,7 @@ var ErrorNoVbSpecified = errors.New("No vb being specified")
 var ErrorCollectionManifestNotChanged = errors.New("Collection manifest has not changed")
 var ErrorSystemScopeMapped = errors.New("System scope is mapped")
 var ErrorAdvFilterMixedModeUnsupported = errors.New("Not all nodes support advanced filtering so adv filtering editing is not allowed")
+var ErrorDocumentNotFound = errors.New("Document not found")
 
 func GetBackfillFatalDataLossError(specId string) error {
 	return fmt.Errorf("%v experienced fatal error when trying to create backfill request. To prevent data loss, the pipeline must restream from the beginning", specId)
@@ -1450,8 +1451,6 @@ const BypassExpiryKey = "filterBypassExpiry"
 const BypassUncommittedTxnKey = "filterBypassUncommittedTxn"
 
 const MergeFunctionMappingKey = "mergeFunctionMapping"
-const HlvPruningWindowKey = "hlvPruningWindowSec"
-const HlvPruningDefault = 259200 // seconds, 3 days
 
 const JSFunctionTimeoutKey = "jsFunctionTimeoutMs"
 const JSFunctionTimeoutDefault = 20000 // 20s. 10s is not enough in evaluator unit tests
@@ -1517,6 +1516,15 @@ const (
 	BucketMergeFunctionKey = "default"
 
 	CCRKVRestCallRetryInterval = 2 * time.Second
+)
+
+const (
+	// Bucket setting for version vector pruning
+	VersionPruningWindowHrsKey = "versionPruningWindowHrs"
+	// Bucket setting for enable versioning when CR mode is not custom CR
+	EnableCrossClusterVersioningKey = "enableCrossClusterVersioning"
+	// Bucket setting for starting timestamp (CAS) to eanble versioning
+	VbucketsMaxCasKey = "vbucketsMaxCas"
 )
 
 const DcpSeqnoEnd = uint64(0xFFFFFFFFFFFFFFFF)
