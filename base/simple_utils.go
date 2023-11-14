@@ -1803,6 +1803,10 @@ func (spec *SubdocLookupPathSpec) Size() int {
 	return 4 + len(spec.Path)
 }
 
+func (spec *SubdocLookupPathSpec) String() string {
+	return fmt.Sprintf("Opcode:%v,flags:%v,path:%s", spec.Opcode, spec.Flags, spec.Path)
+}
+
 // resp is a response to subdoc_multi_lookup based on the path specs
 type SubdocLookupResponse struct {
 	Specs []SubdocLookupPathSpec
@@ -1815,6 +1819,9 @@ type SubdocLookupResponse struct {
 // The path name for document body is empty string
 func (lookupResp *SubdocLookupResponse) ResponseForAPath(path string) ([]byte, error) {
 	resp := lookupResp.Resp
+	if resp.Status == mc.KEY_ENOENT {
+		return nil, nil
+	}
 	body := resp.Body
 	pos := 0
 	for i := 0; i < len(lookupResp.Specs); i++ {
