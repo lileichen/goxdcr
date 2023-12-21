@@ -755,6 +755,9 @@ type XmemNozzle struct {
 	memcachedErrMap map[string]interface{}
 
 	eventsProducer common.PipelineEventsProducer
+
+	importMutationEventRaised bool
+	importMutationEventId     int64
 }
 
 func getGuardrailIdx(status mc.Status) int {
@@ -1340,6 +1343,14 @@ func (xmem *XmemNozzle) batchSetMetaWithRetry(batch *dataBatch, numOfRetry int) 
 					ImportMutation: item.ImportMutation,
 				}
 				xmem.RaiseEvent(common.NewEvent(common.DataFailedCRSource, nil, xmem, nil, additionalInfo))
+				if item.ImportMutation && xmem.config.mobileCompatible == base.MobileCompatibilityOff && !xmem.importMutationEventRaised {
+					xmem.importMutationEventRaised = true
+					xmem.importMutationEventId = xmem.eventsProducer.AddEvent(
+						base.LowPriorityMsg,
+						base.ImportDetectedStr,
+						base.EventsMap{},
+						nil)
+				}
 				xmem.recycleDataObj(item)
 			default:
 				xmem.recycleDataObj(item)
@@ -2305,7 +2316,7 @@ func (xmem *XmemNozzle) initialize(settings metadata.ReplicationSettingsMap) err
 			xmem.Logger().Errorf("Cannot convert target bucket UUID %v to base64. Error: %v", xmem.targetClusterUuid, err)
 			return err
 		}
-		xmem.Logger().Infof("%v: Using %s(UUID %s) and %s(UUID %s as source and target bucket IDs for HLV.",
+		xmem.Logger().Infof("%v: Using %s(UUID %s) and %s(UUID %s) as source and target bucket IDs for HLV.",
 			xmem.Id(), xmem.sourceBucketId, xmem.sourceBucketUuid, xmem.targetBucketId, xmem.targetBucketUuid)
 	}
 
@@ -2615,7 +2626,14 @@ func (xmem *XmemNozzle) receiveResponse(finch chan bool, waitGrp *sync.WaitGroup
 						CloneSyncCh:         wrappedReq.ClonedSyncCh,
 					}
 					xmem.RaiseEvent(common.NewEvent(common.DataSent, nil, xmem, nil, additionalInfo))
-
+					if wrappedReq.ImportMutation && xmem.config.mobileCompatible == base.MobileCompatibilityOff && !xmem.importMutationEventRaised {
+						xmem.importMutationEventRaised = true
+						xmem.importMutationEventId = xmem.eventsProducer.AddEvent(
+							base.LowPriorityMsg,
+							base.ImportDetectedStr,
+							base.EventsMap{},
+							nil)
+					}
 					//feedback the most current commit_time to xmem.config.respTimeout
 					xmem.adjustRespTimeout(resp_wait_time)
 
@@ -3529,6 +3547,10 @@ func (xmem *XmemNozzle) UpdateSettings(settings metadata.ReplicationSettingsMap)
 		atomic.StoreUint32(&xmem.config.mobileCompatible, uint32(mobileCompatibleInt))
 		if oldMobileCompatible != mobileCompatible {
 			xmem.Logger().Infof("%v updated %v to %v\n", xmem.Id(), MOBILE_COMPATBILE, mobileCompatible)
+		}
+		if mobileCompatible != base.MobileCompatibilityOff && xmem.importMutationEventRaised {
+			xmem.importMutationEventRaised = false
+			xmem.eventsProducer.DismissEvent(int(xmem.importMutationEventId))
 		}
 	}
 	return nil
