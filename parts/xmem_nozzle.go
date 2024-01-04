@@ -756,7 +756,7 @@ type XmemNozzle struct {
 
 	eventsProducer common.PipelineEventsProducer
 
-	importMutationEventRaised bool
+	importMutationEventRaised uint32
 	importMutationEventId     int64
 }
 
@@ -1343,8 +1343,7 @@ func (xmem *XmemNozzle) batchSetMetaWithRetry(batch *dataBatch, numOfRetry int) 
 					ImportMutation: item.ImportMutation,
 				}
 				xmem.RaiseEvent(common.NewEvent(common.DataFailedCRSource, nil, xmem, nil, additionalInfo))
-				if item.ImportMutation && xmem.config.mobileCompatible == base.MobileCompatibilityOff && !xmem.importMutationEventRaised {
-					xmem.importMutationEventRaised = true
+				if item.ImportMutation && xmem.getMobileCompatible() == base.MobileCompatibilityOff && atomic.CompareAndSwapUint32(&xmem.importMutationEventRaised, 0, 1) {
 					xmem.importMutationEventId = xmem.eventsProducer.AddEvent(
 						base.LowPriorityMsg,
 						base.ImportDetectedStr,
@@ -2398,7 +2397,7 @@ func (xmem *XmemNozzle) setClient(client *base.XmemClient, isSetMeta bool) {
 }
 
 func (xmem *XmemNozzle) useCasLocking() bool {
-	if xmem.source_cr_mode == base.CRMode_Custom || xmem.config.mobileCompatible != base.MobileCompatibilityOff {
+	if xmem.source_cr_mode == base.CRMode_Custom || xmem.getMobileCompatible() != base.MobileCompatibilityOff {
 		return true
 	}
 	return false
@@ -2626,8 +2625,7 @@ func (xmem *XmemNozzle) receiveResponse(finch chan bool, waitGrp *sync.WaitGroup
 						CloneSyncCh:         wrappedReq.ClonedSyncCh,
 					}
 					xmem.RaiseEvent(common.NewEvent(common.DataSent, nil, xmem, nil, additionalInfo))
-					if wrappedReq.ImportMutation && xmem.config.mobileCompatible == base.MobileCompatibilityOff && !xmem.importMutationEventRaised {
-						xmem.importMutationEventRaised = true
+					if wrappedReq.ImportMutation && xmem.getMobileCompatible() == base.MobileCompatibilityOff && atomic.CompareAndSwapUint32(&xmem.importMutationEventRaised, 0, 1) {
 						xmem.importMutationEventId = xmem.eventsProducer.AddEvent(
 							base.LowPriorityMsg,
 							base.ImportDetectedStr,
@@ -3548,8 +3546,7 @@ func (xmem *XmemNozzle) UpdateSettings(settings metadata.ReplicationSettingsMap)
 		if oldMobileCompatible != mobileCompatible {
 			xmem.Logger().Infof("%v updated %v to %v\n", xmem.Id(), MOBILE_COMPATBILE, mobileCompatible)
 		}
-		if mobileCompatible != base.MobileCompatibilityOff && xmem.importMutationEventRaised {
-			xmem.importMutationEventRaised = false
+		if mobileCompatible != base.MobileCompatibilityOff && atomic.CompareAndSwapUint32(&xmem.importMutationEventRaised, 1, 0) {
 			xmem.eventsProducer.DismissEvent(int(xmem.importMutationEventId))
 		}
 	}
